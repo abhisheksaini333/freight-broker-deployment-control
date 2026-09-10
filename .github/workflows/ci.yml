@@ -1,0 +1,29 @@
+name: Public control verification
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout public controls
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run repository contract and release verification tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Reject non-allowlisted or sensitive public content
+        run: python3 scripts/validate-repository.py
+
+      - name: Validate bounded shell helper syntax
+        run: bash -n scripts/wait-for-ssm-command.sh

@@ -1,0 +1,304 @@
+name: Deploy signed pilot release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repository:
+        description: Exact private source repository owner/name
+        required: true
+        type: string
+      release_ref:
+        description: Exact refs/tags/release-* source ref
+        required: true
+        type: string
+      commit_sha:
+        description: Exact 40-character released commit
+        required: true
+        type: string
+      release_uri:
+        description: Immutable ECR release URI with sha256 digest
+        required: true
+        type: string
+      manifest_sha256:
+        description: Out-of-band reviewed release-manifest SHA-256
+        required: true
+        type: string
+      release_run_id:
+        description: Successful private Signed pilot release workflow run ID
+        required: true
+        type: string
+      release_run_attempt:
+        description: Exact successful private release workflow run attempt
+        required: true
+        type: string
+      previous_release_digest:
+        description: Previous signed release digest; blank only for the first deployment
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: freight-broker-pilot-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Approval-gated digest deployment
+    environment: pilot
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: us-east-1
+      SOURCE_REPOSITORY: ${{ github.event.inputs.source_repository }}
+      RELEASE_REF: ${{ github.event.inputs.release_ref }}
+      RELEASE_SHA: ${{ github.event.inputs.commit_sha }}
+      RELEASE_URI: ${{ github.event.inputs.release_uri }}
+      MANIFEST_SHA256: ${{ github.event.inputs.manifest_sha256 }}
+      RELEASE_RUN_ID: ${{ github.event.inputs.release_run_id }}
+      RELEASE_RUN_ATTEMPT: ${{ github.event.inputs.release_run_attempt }}
+      PREVIOUS_RELEASE_DIGEST: ${{ github.event.inputs.previous_release_digest }}
+      AI_GLOBAL_ENABLED: "false"
+      AI_OPENAI_ROUTE_ENABLED: "false"
+      AI_LOCAL_DETERMINISTIC_PROVIDERS_ENABLED: "false"
+      AI_LOCAL_PRICING_DRAFTS_ENABLED: "false"
+      ALLOW_EXTERNAL_WRITES: "false"
+      TMS_EXTERNAL_WRITES_ENABLED: "false"
+      BROWSER_EXECUTION_ENABLED: "false"
+      OUTBOUND_OUTREACH_ENABLED: "false"
+      ACCOUNTING_WRITES_ENABLED: "false"
+      PAYMENT_EXECUTION_ENABLED: "false"
+      APPLICATION_TELEPHONY_ENABLED: "false"
+      EMAIL_DELIVERY_ENABLED: "false"
+      SES_RECEIPT_SIGNATURE_VERIFICATION_ENABLED: "false"
+      SES_SUPPRESSION_ENABLED: "false"
+      PUBLIC_REGISTRATION_ENABLED: "false"
+      SALES_PROVIDER_TEST_SEED_ENABLED: "false"
+      SALES_VOICE_TEST_SEED_ENABLED: "false"
+      TENDER_LOAD_CREATION_E2E_ENABLED: "false"
+    steps:
+      - name: Checkout public deployment controls
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate immutable deployment inputs
+        run: |
+          set -euo pipefail
+          [[ "${SOURCE_REPOSITORY}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          test "${SOURCE_REPOSITORY}" = "abhisheksaini333/freight-broker"
+          [[ "${RELEASE_REF}" =~ ^refs/tags/release-[A-Za-z0-9][A-Za-z0-9._-]{0,126}$ ]]
+          [[ "${RELEASE_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${RELEASE_URI}" =~ ^[0-9]+\.dkr\.ecr\.us-east-1\.amazonaws\.com/freight-broker-pilot-release@sha256:[0-9a-f]{64}$ ]]
+          [[ "${MANIFEST_SHA256}" =~ ^[0-9a-f]{64}$ ]]
+          [[ "${RELEASE_RUN_ID}" =~ ^[1-9][0-9]*$ ]]
+          [[ "${RELEASE_RUN_ATTEMPT}" =~ ^[1-9][0-9]*$ ]]
+          if [[ -n "${PREVIOUS_RELEASE_DIGEST}" ]]; then
+            [[ "${PREVIOUS_RELEASE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          fi
+
+      - name: Install pinned Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+
+      - name: Install pinned ORAS
+        uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+        with:
+          version: 1.3.4
+
+      - name: Request short-lived pilot deploy credentials
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          aws-region: us-east-1
+          role-to-assume: ${{ secrets.AWS_PILOT_APP_DEPLOY_ROLE_ARN }}
+          role-session-name: deploy-${{ github.run_id }}
+          role-duration-seconds: 7200
+
+      - name: Verify AWS account binding and log in to ECR
+        env:
+          EXPECTED_AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          [[ "${EXPECTED_AWS_ACCOUNT_ID}" =~ ^[0-9]{12}$ ]]
+          test "$(aws sts get-caller-identity --query Account --output text)" = "${EXPECTED_AWS_ACCOUNT_ID}"
+          [[ "${RELEASE_URI}" == "${EXPECTED_AWS_ACCOUNT_ID}.dkr.ecr.us-east-1.amazonaws.com/"* ]]
+
+      - name: Log in to exact ECR account
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2
+        with:
+          registries: ${{ secrets.AWS_ACCOUNT_ID }}
+
+      - name: Verify and pull the exact signed OCI release
+        run: |
+          set -euo pipefail
+          identity="https://github.com/${SOURCE_REPOSITORY}/.github/workflows/release.yml@${RELEASE_REF}"
+          cosign verify \
+            --certificate-identity "${identity}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${RELEASE_URI}"
+          mkdir pulled
+          oras pull "${RELEASE_URI}" --output pulled
+          test "$(find pulled -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" = 1
+          test -f pulled/release-bundle.tar
+          python3 scripts/extract-release-bundle.py \
+            --archive pulled/release-bundle.tar \
+            --output handoff/release-bundle
+
+      - name: Verify the release manifest and every image
+        run: |
+          set -euo pipefail
+          manifest="handoff/release-bundle/release-manifest.v1.json"
+          test "$(sha256sum "${manifest}" | awk '{print $1}')" = "${MANIFEST_SHA256}"
+          python3 scripts/verify-release-manifest.py \
+            --bundle-root handoff/release-bundle \
+            --manifest "${manifest}" \
+            --expected-repository "${SOURCE_REPOSITORY}" \
+            --expected-ref "${RELEASE_REF}" \
+            --expected-commit-sha "${RELEASE_SHA}" \
+            --expected-platform linux/arm64
+          test "$(jq -er '.release.workflow_run_id' "${manifest}")" = "${RELEASE_RUN_ID}"
+          test "$(jq -er '.release.workflow_run_attempt' "${manifest}")" = "${RELEASE_RUN_ATTEMPT}"
+          manifest_previous="$(jq -er '.rollback.previous_release_digest // ""' "${manifest}")"
+          test "${manifest_previous}" = "${PREVIOUS_RELEASE_DIGEST}"
+          identity="https://github.com/${SOURCE_REPOSITORY}/.github/workflows/release.yml@${RELEASE_REF}"
+          jq -er '.images[].uri' "${manifest}" > image-uris.txt
+          test "$(wc -l < image-uris.txt | tr -d ' ')" = 9
+          while IFS= read -r image; do
+            cosign verify \
+              --certificate-identity "${identity}" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "${image}"
+          done < image-uris.txt
+          if [[ -n "${PREVIOUS_RELEASE_DIGEST}" ]]; then
+            repository="${RELEASE_URI%@*}"
+            cosign verify \
+              --certificate-identity-regexp '^https://github.com/abhisheksaini333/freight-broker/.github/workflows/release.yml@refs/tags/release-' \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "${repository}@${PREVIOUS_RELEASE_DIGEST}"
+          fi
+
+      - name: Stage release on both fixed pilot hosts
+        env:
+          CORE_INSTANCE_ID: ${{ secrets.AWS_PILOT_CORE_INSTANCE_ID }}
+          ISOLATED_INSTANCE_ID: ${{ secrets.AWS_PILOT_ISOLATED_INSTANCE_ID }}
+        run: |
+          set -euo pipefail
+          send_operation() {
+            local instance_id="$1" operation="$2" parameters command_id
+            parameters="$(jq -cn \
+              --arg operation "${operation}" --arg release_uri "${RELEASE_URI}" \
+              --arg repository "${SOURCE_REPOSITORY}" --arg release_ref "${RELEASE_REF}" \
+              --arg release_sha "${RELEASE_SHA}" --arg manifest_sha256 "${MANIFEST_SHA256}" \
+              '{Operation:[$operation],ReleaseUri:[$release_uri],ExpectedRepository:[$repository],ExpectedRef:[$release_ref],ExpectedCommitSha:[$release_sha],ExpectedManifestSha256:[$manifest_sha256]}')"
+            command_id="$(aws ssm send-command \
+              --document-name freight-broker-pilot-release \
+              --instance-ids "${instance_id}" --parameters "${parameters}" \
+              --query Command.CommandId --output text)"
+            bash scripts/wait-for-ssm-command.sh "${command_id}" "${instance_id}"
+          }
+          send_operation "${CORE_INSTANCE_ID}" stage
+          send_operation "${ISOLATED_INSTANCE_ID}" stage
+
+      - name: Capture migration head and completed encrypted database snapshot
+        env:
+          CORE_INSTANCE_ID: ${{ secrets.AWS_PILOT_CORE_INSTANCE_ID }}
+          RDS_INSTANCE_ID: ${{ secrets.AWS_PILOT_RDS_INSTANCE_ID }}
+          EXPECTED_RDS_KMS_KEY_ARN: ${{ secrets.AWS_PILOT_RDS_KMS_KEY_ARN }}
+        run: |
+          set -euo pipefail
+          [[ "${EXPECTED_RDS_KMS_KEY_ARN}" =~ ^arn:aws:kms:us-east-1:[0-9]{12}:key/[0-9a-f-]{36}$ ]]
+          parameters="$(jq -cn \
+            --arg release_uri "${RELEASE_URI}" --arg repository "${SOURCE_REPOSITORY}" \
+            --arg release_ref "${RELEASE_REF}" --arg release_sha "${RELEASE_SHA}" \
+            --arg manifest_sha256 "${MANIFEST_SHA256}" \
+            '{Operation:["migration-head"],ReleaseUri:[$release_uri],ExpectedRepository:[$repository],ExpectedRef:[$release_ref],ExpectedCommitSha:[$release_sha],ExpectedManifestSha256:[$manifest_sha256]}')"
+          command_id="$(aws ssm send-command --document-name freight-broker-pilot-release \
+            --instance-ids "${CORE_INSTANCE_ID}" --parameters "${parameters}" \
+            --query Command.CommandId --output text)"
+          bash scripts/wait-for-ssm-command.sh "${command_id}" "${CORE_INSTANCE_ID}" pre-migration-head.json
+          jq -e '.Status == "Success" and (.Output | type == "string" and length > 0)' pre-migration-head.json >/dev/null
+          snapshot_id="freight-broker-pilot-pre-${RELEASE_SHA:0:12}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          aws rds create-db-snapshot \
+            --db-instance-identifier "${RDS_INSTANCE_ID}" \
+            --db-snapshot-identifier "${snapshot_id}" \
+            --tags Key=Project,Value=freight-broker Key=Environment,Value=pilot Key=ReleaseSha,Value="${RELEASE_SHA}"
+          aws rds wait db-snapshot-completed --db-snapshot-identifier "${snapshot_id}"
+          aws rds describe-db-snapshots --db-snapshot-identifier "${snapshot_id}" \
+            --query 'DBSnapshots[0].{Identifier:DBSnapshotIdentifier,Status:Status,Encrypted:Encrypted,SourceDatabase:DBInstanceIdentifier,KmsKeyId:KmsKeyId}' \
+            --output json > pre-deploy-snapshot.json
+          jq -e --arg snapshot "${snapshot_id}" --arg source "${RDS_INSTANCE_ID}" --arg kms "${EXPECTED_RDS_KMS_KEY_ARN}" \
+            '.Identifier == $snapshot and .Status == "available" and .Encrypted == true and .SourceDatabase == $source and .KmsKeyId == $kms' \
+            pre-deploy-snapshot.json >/dev/null
+
+      - name: Migrate once, start core, gate health, then start isolated
+        env:
+          CORE_INSTANCE_ID: ${{ secrets.AWS_PILOT_CORE_INSTANCE_ID }}
+          ISOLATED_INSTANCE_ID: ${{ secrets.AWS_PILOT_ISOLATED_INSTANCE_ID }}
+        run: |
+          set -euo pipefail
+          activated=false
+          send_operation() {
+            local instance_id="$1" operation="$2" parameters command_id
+            parameters="$(jq -cn \
+              --arg operation "${operation}" --arg release_uri "${RELEASE_URI}" \
+              --arg repository "${SOURCE_REPOSITORY}" --arg release_ref "${RELEASE_REF}" \
+              --arg release_sha "${RELEASE_SHA}" --arg manifest_sha256 "${MANIFEST_SHA256}" \
+              '{Operation:[$operation],ReleaseUri:[$release_uri],ExpectedRepository:[$repository],ExpectedRef:[$release_ref],ExpectedCommitSha:[$release_sha],ExpectedManifestSha256:[$manifest_sha256]}')"
+            command_id="$(aws ssm send-command --document-name freight-broker-pilot-release \
+              --instance-ids "${instance_id}" --parameters "${parameters}" \
+              --query Command.CommandId --output text)"
+            bash scripts/wait-for-ssm-command.sh "${command_id}" "${instance_id}"
+          }
+          rollback_on_health_failure() {
+            status=$?
+            if [[ "${activated}" == true ]]; then
+              recovery_failed=false
+              send_operation "${ISOLATED_INSTANCE_ID}" rollback-app || recovery_failed=true
+              send_operation "${CORE_INSTANCE_ID}" rollback-app || recovery_failed=true
+              if [[ "${recovery_failed}" == true ]]; then
+                echo "::error::pilot recovery failed"
+                exit 1
+              fi
+            fi
+            exit "${status}"
+          }
+          trap rollback_on_health_failure ERR
+          send_operation "${CORE_INSTANCE_ID}" migrate-forward
+          activated=true
+          send_operation "${CORE_INSTANCE_ID}" start-core
+          send_operation "${CORE_INSTANCE_ID}" health-core
+          send_operation "${ISOLATED_INSTANCE_ID}" start-isolated
+          send_operation "${ISOLATED_INSTANCE_ID}" health-isolated
+          trap - ERR
+
+      - name: Build sanitized deployment evidence
+        if: always()
+        run: |
+          jq -n \
+            --arg source_repository "${SOURCE_REPOSITORY}" \
+            --arg release_ref "${RELEASE_REF}" \
+            --arg commit_sha "${RELEASE_SHA}" \
+            --arg release_digest "${RELEASE_URI##*@}" \
+            --arg manifest_sha256 "${MANIFEST_SHA256}" \
+            --arg run_id "${GITHUB_RUN_ID}" \
+            --arg run_attempt "${GITHUB_RUN_ATTEMPT}" \
+            --arg completed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{source_repository:$source_repository,release_ref:$release_ref,commit_sha:$commit_sha,release_digest:$release_digest,manifest_sha256:$manifest_sha256,deployment_run_id:$run_id,deployment_run_attempt:$run_attempt,completed_at:$completed_at}' \
+            > deployment-evidence.json
+
+      - name: Retain sanitized deployment evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pilot-deployment-${{ github.event.inputs.commit_sha }}-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: |
+            deployment-evidence.json
+            pre-migration-head.json
+            pre-deploy-snapshot.json
+          if-no-files-found: warn
+          retention-days: 90
